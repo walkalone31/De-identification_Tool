@@ -1,0 +1,23 @@
+# scrub.conf — scrub.sh 的設定。複製成 scrub.conf 再填入真正的值。
+#
+# 這個檔會被 scrub.sh source 進去，所以就是一般的 bash 變數。
+# scrub.conf 裡面會有真實的公司名，不要進版控：
+#     echo 'scrub.conf' >> .gitignore
+
+# 要遮掉的字串。"原字=代號" 換成代號，只寫 "原字" 就塗黑。
+# 比對不分大小寫，不用再加全大寫或全小寫的版本。
+TERMS=( "Apple=VENDOR" "Banana=SUPPLIER" )
+
+# 浮水印：刪掉整個文字物件。要寫「完整」文字。
+# 不確定的話先跑 ./scrub.sh xxx.pdf -n，輸出會提示真正的文字。
+WATERMARKS=( "Apple Confidential" )
+
+# 只保留這些頁。"2-" = 砍掉封面；留空 = 全部保留。
+ONLY_PAGES="2-"
+
+# 單一命中超過整頁幾 % 就跳過不遮（防呆，別關掉）
+MAX_AREA="5"
+
+# -w 的比例門檻：term 佔該文字物件比例 >= 這個值才刪。
+# 浮水印刪不掉時先確認完整文字，再考慮調低這個值。
+WM_RATIO="0.8"
