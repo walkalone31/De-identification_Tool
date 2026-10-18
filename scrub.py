@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-scrub.py — PDF 去識別化 (真的刪掉文字，不是畫黑色方塊)
+scrub.py — 文件去識別化 (真的刪掉文字，不是畫黑色方塊)
+
+支援 PDF (有文字層的) 與純文字檔 (.txt / .md / 原始碼 ...)。
 
 用法：
-    # 一般字串：原地遮蔽
+    # 一般字串：PDF 原地遮蔽／純文字就地取代
     python3 scrub.py spec.pdf -o out.pdf -t Apple -t Banana
+    python3 scrub.py notes.md -t Apple -t Banana
 
-    # 換成代號，文件還讀得懂 (代號請用 ASCII)
+    # 換成代號，文件還讀得懂 (PDF 的代號請用 ASCII)
     python3 scrub.py spec.pdf -t Apple=VENDOR -t Banana=SUPPLIER
 
-    # 浮水印／大面積文字：刪掉整個文字物件，不遮區域
+    # -w：PDF 刪掉整個文字物件 (浮水印)；純文字刪掉整行 (橫幅)
     python3 scrub.py spec.pdf -o out.pdf -t Apple -w 'Apple Confidential'
+    python3 scrub.py notes.md -w 'Apple Confidential'
 
     # 字串放檔案，一行一個，# 開頭是註解；- 表示 stdin
     python3 scrub.py spec.pdf -T terms.txt
 
-    # 只輸出 12-15 頁 (縮小暴露面，建議搭配使用)
+    # 只輸出 12-15 頁 (縮小暴露面，建議搭配使用；僅 PDF)
     python3 scrub.py spec.pdf --only-pages 12-15 -T terms.txt
+
+    # 副檔名不在清單內的純文字檔，用 --as-text 強制
+    python3 scrub.py spec.adoc --as-text -t Apple
 
     # 先看會清到什麼，不產生檔案
     python3 scrub.py spec.pdf -T terms.txt --dry-run
 
-需要：pip install pymupdf
+需要：PDF 需 pip install pymupdf；純文字檔不需要任何套件
 """
 
 import argparse
@@ -36,7 +43,16 @@ except ImportError:
     try:
         import fitz as pymupdf        # 舊版只有 fitz 這個名字
     except ImportError:
-        sys.exit("缺少 PyMuPDF，請先執行：pip install pymupdf")
+        pymupdf = None                # txt / md 不需要它，等真的要開 PDF 再檢查
+
+
+# 這些副檔名直接走純文字模式；其他副檔名當 PDF，或用 --as-text 強制
+TEXT_EXTS = {".txt", ".md", ".markdown", ".mdown", ".mkd", ".rst",
+             ".text", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml",
+             ".c", ".h", ".cpp", ".hpp", ".py", ".sh", ".ini", ".conf"}
+
+# -t 沒給代號時，純文字模式用這個標記取代 (PDF 模式是塗黑方塊)
+TEXT_REDACT_MARK = "[REDACTED]"
 
 
 # --------------------------------------------------------------------------
@@ -86,10 +102,12 @@ def load_terms(args):
 
     terms = [t for t in terms if t[0]]
 
-    # 字面比對一律不分大小寫，所以 Apple / APPLE 是同一條，留著只會重複計算
+    # 不分大小寫時 Apple / APPLE 是同一條，留著只會重複計算。
+    # 但在真的區分大小寫的模式下它們是兩條，不能合併。
+    cs = args.case_sensitive and (args.regex or getattr(args, "text_mode", False))
     seen, uniq, dupes = set(), [], []
     for pat, repl in terms:
-        key = (pat if args.case_sensitive and args.regex else pat.lower(), repl)
+        key = (pat if cs else pat.lower(), repl)
         if key in seen:
             dupes.append(pat)
             continue
@@ -316,21 +334,189 @@ def verify(path, terms, wm_terms, use_regex, case_sensitive):
 
 
 # --------------------------------------------------------------------------
+# 純文字模式 (.txt / .md / ...)
+# --------------------------------------------------------------------------
+
+# 先 UTF-8，再舊的中文編碼。用哪個解就用哪個寫回去，
+# 免得把原本不是 UTF-8 的檔案寫成 UTF-8 而弄壞其他字。
+TEXT_ENCODINGS = ("utf-8", "cp950", "big5", "gb18030", "latin-1")
+BOM_UTF8 = b"\xef\xbb\xbf"
+
+
+def read_text_file(path):
+    """
+    回傳 (內容, 編碼, 有沒有 BOM)。二進位檔直接拒絕。
+
+    BOM 單獨記錄，不靠 utf-8-sig —— 那個解碼器對沒有 BOM 的檔案也會成功，
+    寫回去時卻一定會加上 BOM，等於偷偷改了原本沒有 BOM 的檔案。
+    """
+    raw = path.read_bytes()
+    if b"\x00" in raw:
+        sys.exit(f"{path.name} 看起來是二進位檔 (含 NUL)，純文字模式不處理。")
+
+    had_bom = raw.startswith(BOM_UTF8)
+    if had_bom:
+        raw = raw[len(BOM_UTF8):]
+
+    for enc in TEXT_ENCODINGS:
+        try:
+            return raw.decode(enc), enc, had_bom
+        except (UnicodeDecodeError, LookupError):
+            continue
+    sys.exit(f"{path.name} 無法解碼，請確認編碼。")
+
+
+def compile_terms(terms, use_regex, case_sensitive):
+    """回傳 [(rx, 取代字串, 原 pattern), ...]"""
+    flags = 0 if case_sensitive else re.IGNORECASE
+    out = []
+    for pat, repl in terms:
+        try:
+            rx = re.compile(pat if use_regex else re.escape(pat), flags)
+        except re.error as e:
+            sys.exit(f"regex 有誤 {pat!r}: {e}")
+        out.append((rx, repl or TEXT_REDACT_MARK, pat))
+    return out
+
+
+def drop_watermark_lines(text, wm_terms, ratio, case_sensitive):
+    """
+    -w 在純文字裡的對應動作：整行刪掉。
+
+    一樣套用 --wm-ratio —— 只有「這一行幾乎就是這個字」才刪，
+    所以 'Apple Confidential' 的橫幅行會刪掉，
+    內文裡夾著這幾個字的段落會留下來走一般取代。
+    """
+    if not wm_terms:
+        return text, [], []
+
+    flat_terms = [(_nows(t) if case_sensitive else _nows(t).lower())
+                  for t in wm_terms]
+    flat_terms = [t for t in flat_terms if t]
+
+    kept, dropped, near = [], [], []
+    for line in text.splitlines(keepends=True):
+        flat = _nows(line)
+        if flat:
+            cmp_line = flat if case_sensitive else flat.lower()
+            hit = [t for t in flat_terms if t in cmp_line]
+            if hit:
+                best = max(len(t) / len(flat) for t in hit)
+                if best >= ratio:
+                    dropped.append(line.strip())
+                    continue
+                near.append((line.strip(), best))   # 含該字但比例不足
+        kept.append(line)
+    return "".join(kept), dropped, near
+
+
+def run_text(args, src, out, terms, wm_terms):
+    text, enc, had_bom = read_text_file(src)
+    compiled = compile_terms(terms, args.regex, args.case_sensitive)
+
+    if (args.pages or args.only_pages) and not args.quiet:
+        print("注意：純文字沒有頁的概念，--pages / --only-pages 已忽略",
+              file=sys.stderr)
+
+    # 1. 浮水印／橫幅：整行刪掉
+    new, dropped, near = drop_watermark_lines(text, wm_terms, args.wm_ratio,
+                                              args.case_sensitive)
+
+    # 2. 一般字串取代。用 lambda 當 repl，避免代號裡的 \1 之類被當成反向參照
+    counts = []
+    for rx, repl, pat in compiled:
+        new, n = rx.subn(lambda m, r=repl: r, new)
+        counts.append((pat, repl, n))
+
+    total_hits = sum(n for _, _, n in counts)
+
+    if not args.quiet:
+        print(f"  {src.name} ({enc}{'+BOM' if had_bom else ''}, "
+              f"{len(text.splitlines())} 行)")
+        for pat, repl, n in counts:
+            if n:
+                print(f"    {pat!r} -> {repl!r}  {n} 處")
+        if dropped:
+            print(f"    刪除 {len(dropped)} 行 (-w)")
+        if not total_hits and not dropped:
+            print("    沒有任何命中")
+
+    if dropped and not args.quiet:
+        print("\n-w 刪掉的整行長這樣 (確認沒有內文被誤刪)：")
+        for line in dropped[:5]:
+            print(f"    {line[:70]!r}")
+        if len(dropped) > 5:
+            print(f"    ... 另外還有 {len(dropped) - 5} 行")
+
+    if near and not args.quiet:
+        print(f"\n-w 跳過的行 (含該字但比例 < {args.wm_ratio}，所以沒整行刪)：")
+        for line, pct in near[:5]:
+            print(f"    比例 {pct:.2f}  {line[:70]!r}")
+        if len(near) > 5:
+            print(f"    ... 另外還有 {len(near) - 5} 行")
+        print("   這些行會交給 -t 處理。真的要整行刪就調低 --wm-ratio")
+
+    if wm_terms and not dropped and not args.quiet:
+        print(f"\n注意：-w 一行都沒刪到。確認浮水印／橫幅的完整文字是否正確"
+              + ("" if near else "，或該行是否存在"))
+
+    if args.dry_run:
+        print(f"\n[dry-run] 取代 {total_hits} 處"
+              + (f"、刪除 {len(dropped)} 行" if dropped else "")
+              + "，未寫出檔案")
+        return
+
+    # 原檔有 BOM 才寫 BOM；編碼跟來源一致，不偷偷轉成 UTF-8
+    out.write_bytes((BOM_UTF8 if had_bom else b"") + new.encode(enc))
+
+    print(f"\n已寫出 {out}  (取代 {total_hits} 處"
+          + (f"、刪除 {len(dropped)} 行" if dropped else "") + ")")
+
+    # 驗證：重讀輸出檔，確認字串真的不在了
+    check, _, _ = read_text_file(out)
+    flags = 0 if args.case_sensitive else re.IGNORECASE
+    leaks = []
+    for _, _, pat in compiled:
+        rx = re.compile(pat if args.regex else re.escape(pat), flags)
+        if rx.search(check):
+            leaks.append(pat)
+    for t in wm_terms:
+        if re.search(re.escape(t), check, flags):
+            leaks.append(t)
+
+    if leaks:
+        print("✗ 驗證失敗，輸出檔仍有殘留：")
+        for pat in sorted(set(leaks)):
+            print(f"    {pat}")
+        print("   -w 的字串殘留 = 該行比例不足沒被刪，可改用 -t 取代，"
+              "或調低 --wm-ratio")
+        sys.exit(1)
+
+    print("✓ 驗證通過：輸出檔找不到這些字串")
+    print(f"  另外請自己確認：檔名 ({out.name})、"
+          f"程式碼註解、URL、路徑裡的名字")
+
+
+# --------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="PDF 去識別化：真的刪除文字，並清掉 metadata",
+        description="文件去識別化：真的刪除文字，並清掉 metadata (PDF / 純文字)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：", 1)[1] if "用法：" in __doc__ else None,
     )
-    ap.add_argument("input", help="來源 PDF")
-    ap.add_argument("-o", "--output", help="輸出檔 (預設 <input>.scrubbed.pdf)")
+    ap.add_argument("input", help="來源檔 (PDF，或 .txt / .md 等純文字)")
+    ap.add_argument("-o", "--output",
+                    help="輸出檔 (預設 <input>.scrubbed.<原副檔名>)")
     ap.add_argument("-t", "--term", action="append", metavar="TEXT[=REPL]",
                     help="要遮掉的字串，可重複；寫成 Apple=VENDOR 會換成代號")
     ap.add_argument("-T", "--terms-file", action="append", metavar="FILE",
                     help="從檔案讀字串，一行一個，- 表示 stdin")
     ap.add_argument("-w", "--watermark", action="append", metavar="TEXT", default=[],
-                    help="刪掉含這段文字的整個文字物件 (浮水印專用，不遮區域)")
+                    help="PDF：刪掉含這段文字的整個文字物件 (浮水印專用，不遮區域)；"
+                         "純文字：把含這段文字的整行刪掉")
+    ap.add_argument("--as-text", action="store_true",
+                    help="不管副檔名，一律當純文字處理")
     ap.add_argument("--pages", metavar="RANGE",
                     help="只處理這些頁 (如 12-15,20)，其他頁原樣保留")
     ap.add_argument("--only-pages", metavar="RANGE",
@@ -343,7 +529,8 @@ def main():
     ap.add_argument("--regex", action="store_true",
                     help="把字串當 regex，以 word 為單位比對")
     ap.add_argument("--case-sensitive", action="store_true",
-                    help="區分大小寫；只在 --regex 下有效")
+                    help="區分大小寫。純文字模式一律有效；"
+                         "PDF 模式只在 --regex 下有效")
     ap.add_argument("--keep-annots", action="store_true",
                     help="保留註解與表單欄位 (預設刪除，它們常含人名)")
     ap.add_argument("--dry-run", action="store_true",
@@ -351,8 +538,15 @@ def main():
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args()
 
-    if args.case_sensitive and not args.regex:
-        print("注意：--case-sensitive 只在 --regex 下有效，"
+    src = Path(args.input)
+    if not src.is_file():
+        sys.exit(f"找不到檔案：{src}")
+
+    text_mode = args.as_text or src.suffix.lower() in TEXT_EXTS
+    args.text_mode = text_mode          # load_terms 的去重規則要看這個
+
+    if args.case_sensitive and not args.regex and not text_mode:
+        print("注意：PDF 模式的 --case-sensitive 只在 --regex 下有效，"
               "字面比對一律不分大小寫 (這樣比較安全)", file=sys.stderr)
 
     terms = load_terms(args)
@@ -360,18 +554,30 @@ def main():
     if not terms and not wm_terms:
         sys.exit("沒有指定任何字串，請用 -t / -T / -w")
 
-    src = Path(args.input)
-    if not src.is_file():
-        sys.exit(f"找不到檔案：{src}")
-    out = Path(args.output) if args.output else src.with_suffix(".scrubbed.pdf")
+    if args.output:
+        out = Path(args.output)
+    elif text_mode:
+        out = src.with_name(f"{src.stem}.scrubbed{src.suffix}")
+    else:
+        out = src.with_suffix(".scrubbed.pdf")
     if out.resolve() == src.resolve():
         sys.exit("輸出不能蓋掉原檔")
+
+    # ---- 純文字模式 (.txt / .md / ...) ----
+    if text_mode:
+        run_text(args, src, out, terms, wm_terms)
+        return
+
+    # ---- PDF 模式 ----
+    if pymupdf is None:
+        sys.exit("處理 PDF 需要 PyMuPDF，請先執行：pip install pymupdf\n"
+                 "(純文字檔 .txt / .md 不需要它)")
 
     doc = pymupdf.open(src)
     if not doc.is_pdf:
         fmt = (doc.metadata or {}).get("format") or "未知格式"
-        sys.exit(f"只支援 PDF，這個檔是 {fmt}。"
-                 f"其他格式請先轉成 PDF，或改用該格式自己的工具。")
+        sys.exit(f"這個檔不是 PDF，格式看起來是 {fmt}。\n"
+                 f"純文字檔請改用 --as-text；其他格式請先轉成 PDF。")
     n_pages = doc.page_count
 
     if args.only_pages:
